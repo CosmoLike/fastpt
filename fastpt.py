@@ -3,6 +3,7 @@ from fastpt import FASTPT, FPTHandler
 import os.path as path
 import numpy as np
 from cobaya.theory import Theory
+from cobaya.log import LoggedError
 from typing import Mapping, Iterable
 from cobaya.typing import empty_dict, InfoDict
 from scipy.interpolate import interp2d
@@ -28,26 +29,57 @@ class fastpt(Theory):
         # Cobaya:  (k, P(k)) in  units of 1/Mpc, Mpc^3 respectively
         # ----------------------------------------------------------------------
         
-        self.accuracyboost  = float(self.extra_args.get("accuracyboost", 1.0))
+        # Two grids, two boosts, both defaulting to a configuration
+        # that is already converged, so 1.0 just works:
+        #
+        #   accuracyboost           multiplies the density of the
+        #                           OUTPUT table cosmolike receives.
+        #                           Cosmolike reads it with linear
+        #                           interpolation, so this density is
+        #                           the accuracy driver; the baseline
+        #                           (1.0) is the density measured
+        #                           converged across the TATT prior
+        #                           (about one million points).
+        #   internal_accuracyboost  multiplies the density of the
+        #                           INTERNAL grid the FFTLog
+        #                           convolutions run on; its baseline
+        #                           (1.0, 1100 points) is already
+        #                           accurate, so raising it is a
+        #                           convergence test, not a need.
+        #
+        # A cubic spline in log k upsamples every term from the
+        # internal grid onto the output grid (the internal-grid
+        # strategy of baryon_suppression/bfmt.py), so the dense table
+        # costs almost nothing per sample.
+        self.accuracyboost = float(self.extra_args.get("accuracyboost", 1.0))
+        self.internal_accuracyboost = float(
+            self.extra_args.get("internal_accuracyboost", 1.0))
 
-        # Internal FAST-PT grid boost. Cosmolike reads the output tables
-        # with linear interpolation, so their density (accuracyboost)
-        # controls its interpolation error; the FFTLog convolutions do
-        # not need to run on that dense grid. With internal_accuracyboost
-        # set below accuracyboost, FAST-PT computes on the coarser
-        # internal grid and a cubic spline in log k upsamples every term
-        # onto the output grid (the internal-grid strategy of
-        # baryon_suppression/bfmt.py). Unset, both grids coincide and
-        # the spline is skipped (previous behavior, bit-identical).
-        tmp = self.extra_args.get("internal_accuracyboost", None)
-        self.internal_accuracyboost = (self.accuracyboost if tmp is None
-                                       else min(float(tmp), self.accuracyboost))
+        # Values far above 1 are the pre-2026-09 semantics, in which
+        # accuracyboost counted grid points up from a coarse baseline
+        # (80, 640, 5120, ...). Under the rebased semantics they would
+        # build grids of 10^8+ points and exhaust memory, so refuse
+        # them with the explanation instead.
+        if self.accuracyboost > 8.0:
+            raise LoggedError(
+                self.log,
+                "fastpt accuracyboost = %g: the boost now multiplies an "
+                "already-converged table density (1.0 just works; the "
+                "old grid-count values like 80 or 5120 are no longer "
+                "the scale). Set accuracyboost near 1.",
+                self.accuracyboost)
 
         self.kmax_boltzmann = self.extra_args.get("kmax_boltzmann", 7.5) # 1/Mpc
 
         self.extrap_kmax   = self.extra_args.get("extrap_kmax", 250.0) # 1/Mpc
 
-        FPTboost = np.max(int(self.accuracyboost - 1.0), 0)
+        # BASE_OUTPUT_BOOST carries the rebased baseline in the units
+        # of the historical grid formula, so accuracyboost: 1 lands on
+        # the converged density and fractions reproduce the historical
+        # grids exactly (the frozen regression tests pin 1/5120, the
+        # historical default grid).
+        BASE_OUTPUT_BOOST = 5120.0
+        FPTboost = max(int(BASE_OUTPUT_BOOST * self.accuracyboost) - 1, 0)
 
         self.k_cutoff = 1.0e4 / 2997.92458  # units: h/Mpc
 
@@ -57,7 +89,7 @@ class fastpt(Theory):
                              endpoint=False) # dimensionless (cosmolike units)
         self.k = self.k / 2997.92458  # units: in h/Mpc
 
-        FPTboost_int = max(int(self.internal_accuracyboost - 1.0), 0)
+        FPTboost_int = max(int(self.internal_accuracyboost) - 1, 0)
         if 1100 + 200 * FPTboost_int == len(self.k):
             self.k_internal = self.k
         else:
@@ -86,14 +118,10 @@ class fastpt(Theory):
 
     def get_requirements(self):
       # k_max is what the Boltzmann code actually computes; it does NOT
-      # scale with accuracyboost. The boost refines the FAST-PT k grid
-      # only, and the grid's reach beyond k_max is served by the Pk
+      # scale with the boosts. They change only the density of the two
+      # k grids, whose reach beyond k_max is served by the Pk
       # interpolator's log-extrapolation (the extrap_kmax argument in
       # calculate), the same regime cfastpt's own P(k) input lives in.
-      # Scaling k_max with the boost made CAMB compute P(k) to
-      # kmax_boltzmann * boost (600 1/Mpc at boost 80) for no accuracy
-      # gain in the comparison against cfastpt, at a large cost per
-      # cosmology.
       return {
         "H0": None,
         "Pk_interpolator": {
@@ -133,10 +161,14 @@ class fastpt(Theory):
           bool
               True if the calculation was successful, False otherwise.
       '''
-      mps = self.provider.get_Pk_interpolator(("delta_tot", "delta_tot"), 
-                                              nonlinear = False, 
+      # extrap_kmax does not scale with the boosts: the k range of the
+      # grids is fixed (their density changes), and the interpolator's
+      # log-extrapolation gives the same values below extrap_kmax no
+      # matter how much further it is allowed to reach.
+      mps = self.provider.get_Pk_interpolator(("delta_tot", "delta_tot"),
+                                              nonlinear = False,
                                               extrap_kmin = 1e-6,
-                                              extrap_kmax = self.extrap_kmax*self.accuracyboost)
+                                              extrap_kmax = self.extrap_kmax)
       h0 = par["H0"]/100.0
 
       # FAST-PT input: P_lin on the internal grid. The P_lin row handed
@@ -171,8 +203,8 @@ class fastpt(Theory):
       '''
       Upsample one family of FAST-PT terms from the internal grid onto
       the output grid with a cubic spline in log k. Scalars in the
-      family (e.g. sig4 in one_loop_dd_bias_b3nl) pass through. With
-      internal_accuracyboost unset the family is returned untouched.
+      family (e.g. sig4 in one_loop_dd_bias_b3nl) pass through. When
+      the two grids coincide the family is returned untouched.
       '''
       if not self.spline_to_output:
         return family
