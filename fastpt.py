@@ -7,6 +7,7 @@ from typing import Mapping, Iterable
 from cobaya.typing import empty_dict, InfoDict
 from scipy.interpolate import interp2d
 from scipy.interpolate import interp1d
+from scipy.interpolate import CubicSpline
 
 class fastpt(Theory):
     renames: Mapping[str, str] = empty_dict
@@ -28,29 +29,60 @@ class fastpt(Theory):
         # ----------------------------------------------------------------------
         
         self.accuracyboost  = float(self.extra_args.get("accuracyboost", 1.0))
-        
+
+        # Internal FAST-PT grid boost. Cosmolike reads the output tables
+        # with linear interpolation, so their density (accuracyboost)
+        # controls its interpolation error; the FFTLog convolutions do
+        # not need to run on that dense grid. With internal_accuracyboost
+        # set below accuracyboost, FAST-PT computes on the coarser
+        # internal grid and a cubic spline in log k upsamples every term
+        # onto the output grid (the internal-grid strategy of
+        # baryon_suppression/bfmt.py). Unset, both grids coincide and
+        # the spline is skipped (previous behavior, bit-identical).
+        tmp = self.extra_args.get("internal_accuracyboost", None)
+        self.internal_accuracyboost = (self.accuracyboost if tmp is None
+                                       else min(float(tmp), self.accuracyboost))
+
         self.kmax_boltzmann = self.extra_args.get("kmax_boltzmann", 7.5) # 1/Mpc
-        
+
         self.extrap_kmax   = self.extra_args.get("extrap_kmax", 250.0) # 1/Mpc
-        
+
         FPTboost = np.max(int(self.accuracyboost - 1.0), 0)
-                
+
         self.k_cutoff = 1.0e4 / 2997.92458  # units: h/Mpc
-                
-        self.k = np.logspace(np.log10(0.05), 
-                             np.log10(1.0e+6), 
-                             1100 + 200 * FPTboost, 
+
+        self.k = np.logspace(np.log10(0.05),
+                             np.log10(1.0e+6),
+                             1100 + 200 * FPTboost,
                              endpoint=False) # dimensionless (cosmolike units)
         self.k = self.k / 2997.92458  # units: in h/Mpc
-        
-        self.P_window = np.array([.2, .2]) 
-        
-        self.C_window = .65  
-        
-        self.fptmodel = FASTPT(self.k, 
-                               low_extrap = -5, 
-                               high_extrap = 3, 
-                               n_pad = int(0.5*len(self.k)))
+
+        FPTboost_int = max(int(self.internal_accuracyboost - 1.0), 0)
+        if 1100 + 200 * FPTboost_int == len(self.k):
+            self.k_internal = self.k
+        else:
+            self.k_internal = np.logspace(np.log10(0.05),
+                                          np.log10(1.0e+6),
+                                          1100 + 200 * FPTboost_int,
+                                          endpoint=False) / 2997.92458
+        # log-k nodes for the upsampling spline (grids are fixed). The
+        # output grid's last points sit at most one internal spacing
+        # past the last internal node (endpoint=False geometry), two
+        # decades beyond k_cutoff, so CubicSpline's default polynomial
+        # extension there is inconsequential.
+        self.spline_to_output = self.k_internal is not self.k
+        if self.spline_to_output:
+            self._log_k_internal = np.log(self.k_internal)
+            self._log_k = np.log(self.k)
+
+        self.P_window = np.array([.2, .2])
+
+        self.C_window = .65
+
+        self.fptmodel = FASTPT(self.k_internal,
+                               low_extrap = -5,
+                               high_extrap = 3,
+                               n_pad = int(0.5*len(self.k_internal)))
 
     def get_requirements(self):
       # k_max is what the Boltzmann code actually computes; it does NOT
@@ -106,22 +138,49 @@ class fastpt(Theory):
                                               extrap_kmin = 1e-6,
                                               extrap_kmax = self.extrap_kmax*self.accuracyboost)
       h0 = par["H0"]/100.0
-      
-      self.mps = mps.P(0, self.k*h0) * (h0**3)  # in (Mpc/h)^3
-      
-      state['IA_tt']  = self.fptmodel.IA_tt(self.mps, 
-                                            P_window = self.P_window, 
-                                            C_window = self.C_window)
-      state['IA_ta']  = self.fptmodel.IA_ta(self.mps, 
-                                            P_window = self.P_window, 
-                                            C_window = self.C_window)
-      state['IA_mix'] = self.fptmodel.IA_mix(self.mps,
-                                             P_window = self.P_window, 
-                                             C_window = self.C_window)
-      state['one_loop_dd_bias_b3nl'] = self.fptmodel.one_loop_dd_bias_b3nl(self.mps, 
-                                                                           P_window = self.P_window, 
-                                                                           C_window = self.C_window)
+
+      # FAST-PT input: P_lin on the internal grid. The P_lin row handed
+      # to cosmolike (self.mps) lives on the output grid; with the
+      # spline active it comes straight from the interpolator (exact),
+      # never from the upsampling spline.
+      mps_internal = mps.P(0, self.k_internal*h0) * (h0**3)  # in (Mpc/h)^3
+      if self.spline_to_output:
+        self.mps = mps.P(0, self.k*h0) * (h0**3)
+      else:
+        self.mps = mps_internal
+
+      state['IA_tt']  = self._to_output_grid(
+                          self.fptmodel.IA_tt(mps_internal,
+                                              P_window = self.P_window,
+                                              C_window = self.C_window))
+      state['IA_ta']  = self._to_output_grid(
+                          self.fptmodel.IA_ta(mps_internal,
+                                              P_window = self.P_window,
+                                              C_window = self.C_window))
+      state['IA_mix'] = self._to_output_grid(
+                          self.fptmodel.IA_mix(mps_internal,
+                                               P_window = self.P_window,
+                                               C_window = self.C_window))
+      state['one_loop_dd_bias_b3nl'] = self._to_output_grid(
+                          self.fptmodel.one_loop_dd_bias_b3nl(mps_internal,
+                                                              P_window = self.P_window,
+                                                              C_window = self.C_window))
       return True
+
+    def _to_output_grid(self, family):
+      '''
+      Upsample one family of FAST-PT terms from the internal grid onto
+      the output grid with a cubic spline in log k. Scalars in the
+      family (e.g. sig4 in one_loop_dd_bias_b3nl) pass through. With
+      internal_accuracyboost unset the family is returned untouched.
+      '''
+      if not self.spline_to_output:
+        return family
+      return tuple(
+        CubicSpline(self._log_k_internal, a)(self._log_k)
+        if isinstance(a, np.ndarray) and a.shape == self.k_internal.shape
+        else a
+        for a in family)
 
     def get_IA_PS(self):
       ''' 
