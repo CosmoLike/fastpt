@@ -53,11 +53,20 @@ class fastpt(Theory):
                                n_pad = int(0.5*len(self.k)))
 
     def get_requirements(self):
-      return {  
+      # k_max is what the Boltzmann code actually computes; it does NOT
+      # scale with accuracyboost. The boost refines the FAST-PT k grid
+      # only, and the grid's reach beyond k_max is served by the Pk
+      # interpolator's log-extrapolation (the extrap_kmax argument in
+      # calculate), the same regime cfastpt's own P(k) input lives in.
+      # Scaling k_max with the boost made CAMB compute P(k) to
+      # kmax_boltzmann * boost (600 1/Mpc at boost 80) for no accuracy
+      # gain in the comparison against cfastpt, at a large cost per
+      # cosmology.
+      return {
         "H0": None,
         "Pk_interpolator": {
           "z": np.array([0.0, ]),
-          "k_max": self.kmax_boltzmann * self.accuracyboost,
+          "k_max": self.kmax_boltzmann,
           "nonlinear": False,
           "vars_pairs": [("delta_tot", "delta_tot")]
         }
